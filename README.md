@@ -1,5 +1,7 @@
 # agents-meter
 
+English | [简体中文](README.zh-CN.md)
+
 A Python library that reads, from this machine, what Claude Code, Codex and Grok have left and have used: quota windows and their resets, tokens and their estimated cost, and the sessions running. Standard library only. It is what [agents-usage](https://github.com/iskerwin/agents-usage) (a macOS menu bar app) and [rex-agents](https://github.com/iskerwin/rex-agents) (a Rex side panel) draw from.
 
 ```bash
