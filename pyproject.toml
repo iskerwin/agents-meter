@@ -1,0 +1,22 @@
+[project]
+name = "agents-meter"
+version = "0.1.0"
+description = "Quota, token usage, cost and running sessions of Claude Code, Codex and Grok, read from this machine"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["uv_build>=0.8,<1"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
