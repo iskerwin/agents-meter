@@ -411,3 +411,23 @@ def test_an_unreadable_shared_state_starts_empty(monkeypatch):
     monkeypatch.setattr(quota, "_claude_token", lambda: "tok")
     monkeypatch.setattr(quota, "_fetch_claude_live", lambda token: {"five_hour": {"utilization": 5, "resets_at": FUTURE}})
     assert ClaudeQuota(live=True).query()[0].windows[0].used_percent == 5
+
+
+def test_every_source_gives_each_window_its_length_and_model():
+    codex = parse_codex_windows({"primary": {"windowDurationMins": 300, "usedPercent": 1, "resetsAt": FUTURE}},
+                                "windowDurationMins", "usedPercent", "resetsAt")
+    claude = parse_claude_live({"limits": FABLE_LIMITS})
+    statusline = parse_claude_statusline({"seven_day_opus": {"used_percentage": 5, "resets_at": FUTURE}})
+    grok = parse_grok_billing({"config": {"creditUsagePercent": 10,
+                                          "currentPeriod": {"type": quota.GROK_WEEKLY_PERIOD, "end": FUTURE}}})
+    assert [(w.seconds, w.model) for w in codex] == [(18000, None)]
+    assert [(w.seconds, w.model) for w in claude] == [(18000, None), (604800, None), (604800, "Fable")]
+    assert [(w.label, w.seconds, w.model) for w in statusline] == [("每周 (Opus)", 604800, "Opus")]
+    assert [(w.seconds, w.model) for w in grok] == [(604800, None)]
+
+
+def test_a_window_round_trips_and_older_saved_data_still_reads():
+    window = Window.spanning(604800, 12.5, FUTURE, "Fable")
+    assert Window.from_dict(window.to_dict()) == window
+    old = Window.from_dict({"label": "每周", "used_percent": 1, "resets_at": None})
+    assert (old.seconds, old.model) == (None, None)

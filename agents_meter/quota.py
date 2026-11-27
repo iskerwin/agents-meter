@@ -53,11 +53,14 @@ CODEX_TIMEOUT_SECONDS = 12.0
 
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
+FIVE_HOURS = 5 * 3600
+WEEK = 7 * 86400
+# The older per-window keys of the statusLine snapshot and the usage endpoint: key, length, model.
 CLAUDE_WINDOWS = (
-    ("five_hour", "5 小时"),
-    ("seven_day", "每周"),
-    ("seven_day_opus", "每周 (Opus)"),
-    ("seven_day_sonnet", "每周 (Sonnet)"),
+    ("five_hour", FIVE_HOURS, None),
+    ("seven_day", WEEK, None),
+    ("seven_day_opus", WEEK, "Opus"),
+    ("seven_day_sonnet", WEEK, "Sonnet"),
 )
 CLAUDE_SETUP_NOTE = "尚未接入配额：配置 statusLine 快照，或用 --claude-live 启动（见 README）"
 
@@ -70,11 +73,39 @@ GROK_EXPIRED_NOTE = "登录凭据已过期且未能续期：运行一次 grok �
 GROK_RENEW_TIMEOUT_SECONDS = 30
 
 
+def window_label(seconds: int, model: Optional[str] = None) -> str:
+    """The label people read: `5 小时`, `每周`, `每周 (Fable)`. Consumers MUST
+    read a window's length and model from ``seconds`` and ``model``, never
+    from this text."""
+    minutes = seconds // 60
+    if 4 * 60 <= minutes <= 6 * 60:
+        text = "5 小时"
+    elif 6 * 1440 <= minutes <= 8 * 1440:
+        text = "每周"
+    elif minutes % 1440 == 0:
+        text = f"{minutes // 1440} 天"
+    else:
+        text = f"{minutes // 60} 小时" if minutes % 60 == 0 else f"{minutes} 分钟"
+    return f"{text} ({model})" if model else text
+
+
 @dataclass
 class Window:
     label: str
     used_percent: float
     resets_at: Optional[int] = None
+    seconds: Optional[int] = None  # how long the window runs; None only in data saved before 0.2
+    model: Optional[str] = None  # the model a per-model allowance is for
+
+    @classmethod
+    def spanning(cls, seconds: int, used_percent: float, resets_at: Optional[int],
+                 model: Optional[str] = None) -> "Window":
+        return cls(window_label(seconds, model), used_percent, resets_at, seconds, model)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Window":
+        return cls(data["label"], data["used_percent"], data.get("resets_at"), data.get("seconds"),
+                   data.get("model"))
 
     @property
     def left_percent(self) -> float:
@@ -87,7 +118,11 @@ class Window:
         return "low" if self.left_percent <= LOW_MAX_LEFT else "ok"
 
     def to_dict(self) -> dict[str, Any]:
-        return {**asdict(self), "left_percent": self.left_percent, "level": self.level}
+        return {**self.stored(), "left_percent": self.left_percent, "level": self.level}
+
+    def stored(self) -> dict[str, Any]:
+        """The fields ``from_dict`` reads back."""
+        return asdict(self)
 
 
 @dataclass
@@ -129,16 +164,6 @@ def _live_windows(windows: list[Window], now: int) -> list[Window]:
     return [w for w in windows if w.resets_at is None or w.resets_at > now]
 
 
-def _codex_label(minutes: int) -> str:
-    if 4 * 60 <= minutes <= 6 * 60:
-        return "5 小时"
-    if 6 * 1440 <= minutes <= 8 * 1440:
-        return "每周"
-    if minutes % 1440 == 0:
-        return f"{minutes // 1440} 天"
-    return f"{minutes // 60} 小时" if minutes % 60 == 0 else f"{minutes} 分钟"
-
-
 def parse_codex_windows(limits: dict[str, Any], minutes_key: str, used_key: str, reset_key: str) -> list[Window]:
     """Label windows by their reported duration, never by slot: Codex has moved
     the 5-hour and weekly windows between primary and secondary before."""
@@ -150,8 +175,8 @@ def parse_codex_windows(limits: dict[str, Any], minutes_key: str, used_key: str,
         minutes, used = raw.get(minutes_key), _percent(raw.get(used_key))
         if not isinstance(minutes, int) or minutes <= 0 or used is None:
             continue
-        windows.append(Window(_codex_label(minutes), used, _reset_epoch(raw.get(reset_key))))
-    return sorted(windows, key=lambda w: (w.label != "5 小时", w.label != "每周"))
+        windows.append(Window.spanning(minutes * 60, used, _reset_epoch(raw.get(reset_key))))
+    return sorted(windows, key=lambda w: w.seconds)
 
 
 class CodexAppServer:
@@ -297,14 +322,6 @@ def shared_state(name: str) -> Iterator[dict[str, Any]]:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def _windows_from(data: Any) -> list[Window]:
-    return [Window(w["label"], w["used_percent"], w.get("resets_at")) for w in data]
-
-
-def _windows_to(windows: list[Window]) -> list[dict[str, Any]]:
-    return [{"label": w.label, "used_percent": w.used_percent, "resets_at": w.resets_at} for w in windows]
-
-
 def statusline_path() -> Path:
     return cache_dir() / "claude-statusline.json"
 
@@ -313,25 +330,26 @@ def parse_claude_statusline(rate_limits: Any) -> list[Window]:
     if not isinstance(rate_limits, dict):
         return []
     windows = []
-    for key, label in CLAUDE_WINDOWS:
+    for key, seconds, model in CLAUDE_WINDOWS:
         raw = rate_limits.get(key)
         used = _percent(raw.get("used_percentage")) if isinstance(raw, dict) else None
         if used is not None:
-            windows.append(Window(label, used, _reset_epoch(raw.get("resets_at"))))
+            windows.append(Window.spanning(seconds, used, _reset_epoch(raw.get("resets_at")), model))
     return windows
 
 
-def _claude_limit_label(limit: dict[str, Any]) -> Optional[str]:
+def _claude_limit_span(limit: dict[str, Any]) -> Optional[tuple[int, Optional[str]]]:
+    """A ``limits`` entry's length and model; None for a kind it cannot place."""
     kind = limit.get("kind")
     if kind == "session":
-        return "5 小时"
+        return FIVE_HOURS, None
     if kind == "weekly_all":
-        return "每周"
+        return WEEK, None
     if kind == "weekly_scoped":
         scope = limit.get("scope")
         model = scope.get("model") if isinstance(scope, dict) else None
         name = model.get("display_name") if isinstance(model, dict) else None
-        return f"每周 ({name.strip()})" if isinstance(name, str) and name.strip() else None
+        return (WEEK, name.strip()) if isinstance(name, str) and name.strip() else None
     return None
 
 
@@ -340,10 +358,10 @@ def parse_claude_limits(limits: Any) -> list[Window]:
     Fable's. One that the plan does not have is simply absent from it."""
     windows: list[Window] = []
     for raw in limits if isinstance(limits, list) else []:
-        label = _claude_limit_label(raw) if isinstance(raw, dict) else None
-        used = _percent(raw.get("percent")) if label else None
-        if used is not None and all(w.label != label for w in windows):
-            windows.append(Window(label, used, _reset_epoch(raw.get("resets_at"))))
+        span = _claude_limit_span(raw) if isinstance(raw, dict) else None
+        used = _percent(raw.get("percent")) if span else None
+        if used is not None and all((w.seconds, w.model) != span for w in windows):
+            windows.append(Window.spanning(span[0], used, _reset_epoch(raw.get("resets_at")), span[1]))
     return windows
 
 
@@ -352,11 +370,11 @@ def parse_claude_live(payload: Any) -> list[Window]:
         raise ValueError("响应格式不符")
     # The list or the older per-window keys, never both: a label names one window.
     windows = parse_claude_limits(payload.get("limits"))
-    for key, label in CLAUDE_WINDOWS if not windows else ():
+    for key, seconds, model in CLAUDE_WINDOWS if not windows else ():
         raw = payload.get(key)
         used = _percent(raw.get("utilization")) if isinstance(raw, dict) else None
         if used is not None:
-            windows.append(Window(label, used, _reset_epoch(raw.get("resets_at"))))
+            windows.append(Window.spanning(seconds, used, _reset_epoch(raw.get("resets_at")), model))
     if not windows:
         raise ValueError("响应中没有配额窗口")
     return windows
@@ -455,14 +473,14 @@ class ClaudeQuota:
                 self._last_attempt = float(state.get("attempt_at", 0))
                 self._wait = float(state.get("wait", CLAUDE_MIN_REFRESH_SECONDS))
                 live = state.get("live")
-                self._last_live = (int(live["captured_at"]), _windows_from(live["windows"])) if live else None
+                self._last_live = (int(live["captured_at"]), [Window.from_dict(w) for w in live["windows"]]) if live else None
                 self._last_problem = state.get("problem")
             except (KeyError, TypeError, ValueError):
                 pass
             self._ask_live()
             state.update({
                 "attempt_at": self._last_attempt, "wait": self._wait, "problem": self._last_problem,
-                "live": {"captured_at": self._last_live[0], "windows": _windows_to(self._last_live[1])}
+                "live": {"captured_at": self._last_live[0], "windows": [w.stored() for w in self._last_live[1]]}
                 if self._last_live else None,
             })
 
@@ -570,7 +588,7 @@ def parse_grok_billing(payload: Any) -> list[Window]:
     if not isinstance(period, dict) or period.get("type") != GROK_WEEKLY_PERIOD:
         return []
     used = _percent(config.get("creditUsagePercent"))
-    return [] if used is None else [Window("每周", used, _reset_epoch(period.get("end")))]
+    return [] if used is None else [Window.spanning(WEEK, used, _reset_epoch(period.get("end")))]
 
 
 def _fetch_grok(url: str, token: str) -> Any:
@@ -602,7 +620,7 @@ class GrokQuota:
             try:
                 self._last_attempt = float(state.get("attempt_at", 0))
                 last = state.get("last")
-                self._last = (int(last["captured_at"]), _windows_from(last["windows"]), last.get("plan"),
+                self._last = (int(last["captured_at"]), [Window.from_dict(w) for w in last["windows"]], last.get("plan"),
                               last.get("email")) if last else None
                 self._problem = state.get("problem")
             except (KeyError, TypeError, ValueError):
@@ -610,7 +628,7 @@ class GrokQuota:
             self._ask()
             state.update({
                 "attempt_at": self._last_attempt, "problem": self._problem,
-                "last": {"captured_at": self._last[0], "windows": _windows_to(self._last[1]),
+                "last": {"captured_at": self._last[0], "windows": [w.stored() for w in self._last[1]],
                          "plan": self._last[2], "email": self._last[3]} if self._last else None,
             })
 
@@ -707,8 +725,7 @@ def age_account(account: Account, now: int) -> Account:
 
 
 def account_from_dict(data: dict[str, Any]) -> Account:
-    windows = [Window(w["label"], w["used_percent"], w.get("resets_at")) for w in data["windows"]]
-    return Account(**{**data, "windows": windows})
+    return Account(**{**data, "windows": [Window.from_dict(w) for w in data["windows"]]})
 
 
 class QuotaService:

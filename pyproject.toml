@@ -1,6 +1,6 @@
 [project]
 name = "agents-meter"
-version = "0.1.0"
+version = "0.2.0"
 description = "Quota, token usage, cost and running sessions of Claude Code, Codex and Grok, read from this machine"
 readme = "README.md"
 license = "MIT"

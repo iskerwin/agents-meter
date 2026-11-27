@@ -57,6 +57,7 @@ Read when `~/.grok/auth.json` exists (written by `grok login`). The token is kep
 - A missing value stays missing. It is never shown as 0% or 100%, and one window is never copied into another.
 - A window past its reset is dropped. A stale snapshot is labelled and never picked as the most urgent.
 - No agent session is started to refresh usage, no manual reset is used, and no limit is touched.
+- Each window carries `seconds` (how long it runs) and `model` (for a per-model allowance such as Fable's, else null). Read length and model from them; `label` (`5 小时`, `每周 (Fable)`) is only for display.
 
 **Cost is an estimate, not a bill.** Tokens are priced at [public API rates](agents_meter/pricing.py); subscriptions don't pay that way. Models without a public price (such as `grok-4.7-build`) aren't counted, nor are long-context and fast-mode surcharges.
 
